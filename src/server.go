@@ -1,8 +1,12 @@
 package src
 
 import (
-	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
+
 	"github.com/go-zoox/chatbot-feishu"
 	"github.com/go-zoox/core-utils/regexp"
 	"github.com/go-zoox/feishu"
@@ -11,10 +15,6 @@ import (
 	feishuEvent "github.com/go-zoox/feishu/event"
 	mc "github.com/go-zoox/feishu/message/content"
 	"github.com/go-zoox/logger"
-	"io"
-	"os/exec"
-	"strings"
-	"time"
 )
 
 // 两种。一种是快速的..一种是长时间执行的
@@ -31,7 +31,7 @@ func getUser(request *feishuEvent.EventRequest) (*user.RetrieveResponse, error) 
 	}, nil
 }
 
-func ReplyText(reply func(context string, msgType ...string) error, text string) error {
+func ReplyText(reply func(content string, msgType ...string) error, text string) error {
 	if text == "" {
 		text = "服务没有返回"
 	}
@@ -56,8 +56,7 @@ func ReplyText(reply func(context string, msgType ...string) error, text string)
 		return fmt.Errorf("failed to build content: %v", err)
 	}
 	if err := reply(string(content), msgType); err != nil {
-		logs.Printf("content :%s", content)
-		logger.Info(fmt.Sprintf("failed to reply: %v", err))
+		logger.Infof("failed to reply: %v", err)
 	}
 
 	return nil
@@ -72,7 +71,7 @@ func getCommand(client feishu.Client, text string, request *feishuEvent.EventReq
 			for _, mention := range request.Event.Message.Mentions {
 				if mention.Key == "@_user_1" && mention.ID.OpenID == botInfo.OpenID {
 					command = strings.Replace(text, "@_user_1", "", 1)
-					logger.Info("chat command %s", command)
+					logger.Infof("chat command %s", command)
 					break
 				}
 			}
@@ -81,15 +80,13 @@ func getCommand(client feishu.Client, text string, request *feishuEvent.EventReq
 		command = text
 	}
 	command = strings.TrimSpace(command)
-	logger.Info("chat command %s", command)
+	logger.Infof("chat command %s", command)
 	return command
 }
 
 func FeishuServer(feishuConf *chatbot.Config) (chatbot.ChatBot, error) {
 	bot, err := chatbot.New(feishuConf)
 	client := feishu.New(&feishu.Config{"https://open.feishu.cn", feishuConf.AppID, feishuConf.AppSecret})
-	chatGptClient := NewChatGptClient()
-	sshServerClient := NewServerCmdClient()
 	if err != nil {
 		logger.Errorf("failed to create bot: %v", err)
 		return nil, err
@@ -106,12 +103,7 @@ func FeishuServer(feishuConf *chatbot.Config) (chatbot.ChatBot, error) {
 
 	bot.OnCommand("help", &chatbot.Command{
 		Handler: func(args []string, request *event.EventRequest, reply chatbot.MessageReply) error {
-			helpText := "直接输入就是运行命令," +
-				"可以用/machines      :查看配置的服务器列表" +
-				"可以用/ssh 服务器  :命令执行远程命令" +
-				"可以用/chatgpt 命令描述 :执行智能命令" +
-				"可以用/gptssh 服务器 命令描述  :执行远程智能命令"
-
+			helpText := "直接输入命令，将会发送一个 HTTP 请求到指定的服务。"
 			if err := ReplyText(reply, helpText); err != nil {
 				return fmt.Errorf("failed to reply: %v", err)
 			}
@@ -119,122 +111,61 @@ func FeishuServer(feishuConf *chatbot.Config) (chatbot.ChatBot, error) {
 		},
 	})
 
-	bot.OnCommand("machines", &chatbot.Command{
-		Handler: func(args []string, request *event.EventRequest, reply chatbot.MessageReply) error {
-			var machineTexts []string
-			for _, machine := range sshServerClient.machines {
-				machineTexts = append(machineTexts, machine.Hostname+fmt.Sprintf("(%s)", machine.IPAddress))
-			}
-			ReplyText(reply, strings.Join(machineTexts, "\r\n"))
-			return nil
-		},
-	})
-
 	bot.OnMessage(func(text string, request *event.EventRequest, reply chatbot.MessageReply) error {
 		command := getCommand(client, text, request)
-		commands := strings.Split(command, " ")
 		if command == "" {
 			logger.Infof("ignore empty command message")
 			return nil
 		}
-		if strings.HasPrefix(command, "/chatgpt") {
-			if chatGptClient == nil {
-				ReplyText(reply, "ChatGpt 没有设置或者相应配置不正确")
-				return nil
-			}
-			command, err := chatGptClient.TranslateChatgptCmd(request.ChatID(), commands[1:]...)
-			if err == nil {
-				ReplyText(reply, fmt.Sprintf("执行command:%s", command))
-				RunCommand(reply, command)
-			} else {
-				ReplyText(reply, fmt.Sprintf("执行命令失败 %v", err))
-			}
-			return nil
-		}
-		if strings.HasPrefix(command, "/gptssh") {
-			command, err := chatGptClient.TranslateChatgptCmd(request.ChatID(), commands[2:]...)
-			if err != nil {
-				ReplyText(reply, fmt.Sprintf("执行命令失败 %v", err))
-			}
-			ReplyText(reply, fmt.Sprintf("执行command:%s", command))
-			output, err := sshServerClient.executeCmd(commands[1], command)
-			if err != nil {
-				ReplyText(reply, fmt.Sprintf("执行命令失败 %v", err))
-			}
-			ReplyText(reply, output)
-			return nil
-		}
-		if strings.HasPrefix(command, "/ssh") {
-			output, err := sshServerClient.executeCmd(commands[1], commands[2:]...)
-			if err != nil {
-				ReplyText(reply, fmt.Sprintf("err %v", err))
-			}
-			ReplyText(reply, output)
+
+		// 忽略以 "/" 开头的命令
+		if strings.HasPrefix(command, "/") {
+			logger.Infof("ignore command message starting with '/'")
 			return nil
 		}
 
-		if strings.HasPrefix(command, "/") {
-			logger.Infof("ignore empty command message")
+		// 发送 HTTP 请求
+		err := SendHTTPRequest(command)
+		if err != nil {
+			ReplyText(reply, fmt.Sprintf("发送 HTTP 请求失败: %v", err))
 			return nil
 		}
-		go func() {
-			RunCommand(reply, command)
-		}()
+
+		// ReplyText(reply, fmt.Sprintf("已发送命令: %s", command))
 		return nil
 	})
 
 	return bot, nil
 }
 
-func RunCommand(reply chatbot.MessageReply, command string) {
-	var newCmd []string
-	if strings.HasPrefix(command, "sshpass") ||
-		strings.HasPrefix(command, "ssh") ||
-		strings.HasPrefix(command, "bash") ||
-		strings.HasPrefix(command, "sudo") ||
-		strings.HasPrefix(command, "su") ||
-		strings.HasPrefix(command, "sh") {
-		newCmd = append(newCmd, strings.Split(command, " ")...)
-	} else {
-		newCmd = append(newCmd, "bash", "-c")
-		newCmd = append(newCmd, command)
+// 修改后的 RunCommand 函数
+func SendHTTPRequest(command string) error {
+	url := "http://localhost:8000/miio/command"
+	payload := map[string]string{
+		"command": command,
 	}
-	cmd := exec.Command(newCmd[0], newCmd[1:]...)
-	logs.Println(cmd)
-	stderr, err := cmd.StderrPipe()
-	stdout, err := cmd.StdoutPipe()
+	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		ReplyText(reply, fmt.Sprintf("run command error %v", err))
-	}
-	// Start command
-	if err := cmd.Start(); err != nil {
-		logger.Infof("error starting command:%v", err)
-		ReplyText(reply, fmt.Sprintf("error run command bro:%v", err))
-		return
+		return fmt.Errorf("failed to marshal JSON: %v", err)
 	}
 
-	stdall := io.MultiReader(stdout, stderr)
-	scanner := bufio.NewScanner(stdall)
-	i := 0
-	for {
-		texts := make([]string, 0)
-		for scanner.Scan() {
-			texts = append(texts, scanner.Text())
-		}
-		if len(texts) == 0 {
-			break
-		}
-		ReplyText(reply, strings.Join(texts, "\r\n"))
-		time.Sleep(1 * time.Second)
-		i = i + 1
-		if i > 20 {
-			ReplyText(reply, "命令运行太久。直接退出")
-			break
-		}
-	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		ReplyText(reply, fmt.Sprintf("run command error %v", err))
+		return fmt.Errorf("failed to create HTTP request: %v", err)
 	}
-	defer stdout.Close()
-	defer stderr.Close()
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send HTTP request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("received non-OK HTTP status: %s", resp.Status)
+	}
+
+	return nil
 }
